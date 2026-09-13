@@ -213,10 +213,22 @@ def rig(tmp_path: Path) -> Iterator[dict[str, Any]]:
 
 
 def _claude_requests(mock_url: str) -> list[dict[str, Any]]:
-    """Requests the mock LLM served for the spec's claude model."""
+    """Requests served by the spec's claude-sdk brain, identified by wire shape.
+
+    The claude-sdk executor speaks the Anthropic Messages API (a ``messages``
+    list). Model name alone cannot identify the brain: the codex-native
+    harness inherits the spec's pinned model id, so the codex CLI legitimately
+    sends ``claude-*`` requests over the OpenAI Responses API (an ``input``
+    list) — those are override-path traffic, not spec-brain hits.
+    """
     reqs = httpx.get(f"{mock_url}/mock/requests", timeout=5).json()["requests"]
     return [
-        r for r in reqs if isinstance(r, dict) and str(r.get("model", "")).startswith("claude")
+        r
+        for r in reqs
+        if isinstance(r, dict)
+        and str(r.get("model", "")).startswith("claude")
+        and isinstance(r.get("messages"), list)
+        and "input" not in r
     ]
 
 

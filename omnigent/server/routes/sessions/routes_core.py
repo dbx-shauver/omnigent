@@ -2239,8 +2239,6 @@ def register_core_routes(
                     # from the spec, and the recovery turn that executes seeded
                     # initial_items ran on the spec's harness. Recovery stays
                     # enabled: on rebind it is what runs the pending kickoff.
-                    from omnigent.version import VERSION
-
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
