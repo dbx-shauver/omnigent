@@ -185,9 +185,12 @@ class AcpAgentConfig:
         Split with :func:`shlex.split` into an argv and exec'd directly (never
         via a shell), so quoting works but ``$VAR`` / pipes / redirects do not.
     :param name: Human label for logs / elicitation cards (e.g. ``"Gemini CLI"``).
-    :param model: Optional model id. Only sent to the agent when
-        :attr:`send_model_in_session_new` is set; otherwise inert (the agent
-        takes its model from its own config or from flags in ``command``).
+    :param model: Optional model id, applied to the live session when a turn
+        carries no per-turn pick — via ``session/set_model`` for agents that
+        advertise a model catalog in ``session/new``, else via the ``model``
+        session config option. With :attr:`send_model_in_session_new` it is
+        also sent in ``session/new`` itself. Unset means the agent keeps the
+        model from its own config or from flags in ``command``.
     :param session_id_mode: ``"server"`` — the agent assigns the session id and
         we adopt it (Goose); ``"client"`` — we generate the id and send it
         (Qwen). Defaults to ``"server"``, the ACP-idiomatic shape.
