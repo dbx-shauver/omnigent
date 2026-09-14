@@ -13,7 +13,10 @@
 const { net } = require("electron");
 const {
   databricksOAuthConfigured,
-  getValidAccessToken,
+  runInteractiveLogin,
+  getValidStoredToken,
+  saveWorkspaceToken,
+  loadTokens,
   isTrustedDatabricksOrigin,
 } = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
@@ -23,53 +26,86 @@ const SESSION_CREATE_PATH = "/auth/session/create";
 const NETWORK_TIMEOUT_MS = 20_000;
 
 /**
- * Ensure ``ses`` holds a live DBAUTH cookie for ``origin``: get (or refresh, or
- * interactively mint) an access token, then exchange it for the cookie.
+ * Ensure ``ses`` holds a live DBAUTH cookie for a workspace, and return that
+ * workspace origin. Two entry points:
+ *
+ * - Connect (``interactive: true``): reuse a stored token for ``origin`` if
+ *   there is one (a relaunch to a workspace origin, or an unexpired session);
+ *   otherwise run the browser login. An account-scoped (SPOG) login lists the
+ *   account's workspaces, calls ``pickWorkspace``, and bridges the account token
+ *   to the chosen one — persisting it keyed by that workspace origin so the
+ *   expiry path can find it.
+ * - Session expiry (``interactive: false``): ``origin`` is the (already
+ *   resolved) workspace origin, so the stored token is found and refreshed and
+ *   the cookie re-minted against the SAME workspace — no browser, no picker.
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
- * @param {string} origin e.g. ``"https://ws.databricks.com"``.
+ * @param {string} origin The entered/pinned origin (account or workspace host).
  * @param {{ interactive?: boolean, nextPath?: string,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
- *   ``pickWorkspace`` is required for account-scoped (SPOG) logins — it chooses
- *   which workspace to bridge the account token to.
- * @returns {Promise<string>} The workspace origin the session was created for
- *   (may differ from ``origin`` in SPOG mode — the user's picked workspace).
+ * @returns {Promise<string>} The workspace origin the session was created for.
  */
 async function ensureDatabricksSession(
   ses,
   origin,
   { interactive = true, nextPath = "/omnigent", pickWorkspace } = {},
 ) {
-  // `issuerOrigin` is where the token was minted (its refresh/exchange host).
-  const { accessToken, workspaceOrigin: issuerOrigin } = await getValidAccessToken(origin, {
-    interactive,
-  });
+  let bridgeOrigin;
+  let accessToken;
 
-  // Decide which workspace host to bridge against. A workspace-scoped token
-  // bridges against its own origin. An ACCOUNT-scoped token (SPOG / account
-  // entry) cannot — the account host has no /auth/session/create — so resolve the
-  // account's workspaces, let the caller pick one, and bridge the account token
-  // against that workspace's FQDN. Mirrors DB One.
-  let bridgeOrigin = issuerOrigin;
-  const account = parseAccountFromToken(accessToken);
-  if (account) {
-    const workspaces = await listRunningWorkspaces(account, accessToken);
-    if (workspaces.length === 0) {
-      throw new Error("no running workspaces available for this account");
+  // 1. Reuse a stored token bound to this origin — covers the expiry path (origin
+  //    is the resolved workspace) and a relaunch straight to a workspace origin.
+  //    The stored token already targets this origin, so no picker is needed.
+  if (loadTokens(origin)) {
+    try {
+      accessToken = await getValidStoredToken(origin);
+      bridgeOrigin = origin;
+    } catch (e) {
+      if (!interactive) throw e;
+      console.warn(`[omnigent] databricks: stored token unusable, re-authenticating: ${e.message}`);
     }
-    if (typeof pickWorkspace !== "function") {
-      throw new Error("account-scoped login requires a workspace picker");
-    }
-    const picked = await pickWorkspace(workspaces);
-    if (!picked) throw new Error("workspace selection cancelled");
-    bridgeOrigin = `https://${picked.fqdn}`;
-    console.log(`[omnigent] databricks session: bridging to workspace ${bridgeOrigin}`);
   }
 
-  // Never send the bearer to a non-Databricks host. bridgeOrigin is either the
-  // token issuer (already validated) or a workspace FQDN from the account API
-  // (validated here) — gate it before the session-create call carries the token.
+  // 2. Nothing usable stored → interactive browser login (connect only).
+  if (!accessToken) {
+    if (!interactive) {
+      throw new Error("no valid Databricks token and interactive login is disabled");
+    }
+    const { tokens, issuerOrigin } = await runInteractiveLogin(origin);
+    const account = parseAccountFromToken(tokens.access_token);
+    if (account) {
+      // Account-scoped (SPOG): the account host has no /auth/session/create, so
+      // resolve the account's workspaces, let the user pick, and bridge to that
+      // workspace. Persist keyed by the workspace origin (with the account
+      // context) so silent refresh later hits the account token endpoint.
+      if (!isTrustedDatabricksOrigin(account.accountOrigin)) {
+        throw new Error(`refusing to use an untrusted account origin: ${account.accountOrigin}`);
+      }
+      const workspaces = await listRunningWorkspaces(account, tokens.access_token);
+      if (workspaces.length === 0) {
+        throw new Error("no running workspaces available for this account");
+      }
+      if (typeof pickWorkspace !== "function") {
+        throw new Error("account-scoped login requires a workspace picker");
+      }
+      const picked = await pickWorkspace(workspaces);
+      if (!picked) throw new Error("workspace selection cancelled");
+      bridgeOrigin = `https://${picked.fqdn}`;
+      saveWorkspaceToken(bridgeOrigin, tokens, {
+        origin: account.accountOrigin,
+        id: account.accountId,
+      });
+      console.log(`[omnigent] databricks session: bridging to workspace ${bridgeOrigin}`);
+    } else {
+      // Workspace-scoped: the token targets the issuer (the entered workspace).
+      bridgeOrigin = issuerOrigin;
+      saveWorkspaceToken(bridgeOrigin, tokens, null);
+    }
+    accessToken = tokens.access_token;
+  }
+
+  // Never send the bearer to a non-Databricks host.
   if (!isTrustedDatabricksOrigin(bridgeOrigin)) {
     throw new Error(`refusing to send credentials to untrusted workspace origin: ${bridgeOrigin}`);
   }

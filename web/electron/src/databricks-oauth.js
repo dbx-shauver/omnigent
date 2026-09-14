@@ -40,8 +40,9 @@ const AUTH_TIMEOUT_MS = 300_000;
 // Per-request network timeout for the token endpoint (and other back-channel
 // calls) so a stalled socket can't hang the awaited connect flow.
 const NETWORK_TIMEOUT_MS = 20_000;
-// Renew a little before real expiry so a mint isn't racing the clock.
-const EXPIRY_SKEW_SECONDS = 60;
+// Treat the access token as expired this long before its real expiry, so a
+// re-mint never races the clock (and a slightly-early refresh is harmless).
+const EXPIRY_SKEW_SECONDS = 300;
 
 /** True for an http(s) URL bound to a loopback host (localhost / 127.0.0.1 / ::1). */
 function isLoopbackUrl(rawUrl) {
@@ -164,10 +165,38 @@ function loadTokens(origin) {
   return null;
 }
 
+function deleteStoredToken(origin) {
+  const store = readStore();
+  if (store[storeKey(origin)]) {
+    delete store[storeKey(origin)];
+    writeStore(store);
+  }
+}
+
+/**
+ * Persist a token keyed by the WORKSPACE origin it is used against. For an
+ * account-first (SPOG) login the token is account-scoped; ``account`` records
+ * the account origin+id so a later silent refresh hits the account token
+ * endpoint. Keying by the workspace origin (not the issuer) is what lets the
+ * session-expiry path — which only knows the workspace — find and refresh it.
+ *
+ * @param {string} workspaceOrigin
+ * @param {{ access_token: string, refresh_token?: string, expires_at: number }} tokens
+ * @param {{ origin: string, id: string } | null} account
+ */
+function saveWorkspaceToken(workspaceOrigin, tokens, account) {
+  saveTokens(workspaceOrigin, {
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    expires_at: tokens.expires_at,
+    account: account ?? undefined,
+  });
+}
+
 // ── OAuth token endpoint ─────────────────────────────────────────────────────
 
-async function postToken(origin, body) {
-  const resp = await fetch(`${origin}/oidc/v1/token`, {
+async function postToken(tokenUrl, body) {
+  const resp = await fetch(tokenUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
@@ -178,7 +207,11 @@ async function postToken(origin, body) {
   });
   const text = await resp.text();
   if (!resp.ok) {
-    throw new Error(`token endpoint ${resp.status}: ${text.slice(0, 300)}`);
+    // Carry the status so refresh can detect a dead grant (400/401 invalid_grant)
+    // and clear it instead of retrying a consumed single-use refresh token.
+    const err = new Error(`token endpoint ${resp.status}: ${text.slice(0, 300)}`);
+    err.status = resp.status;
+    throw err;
   }
   let json;
   try {
@@ -198,7 +231,8 @@ async function postToken(origin, body) {
   };
 }
 
-async function exchangeCode(origin, code, verifier, redirectUri) {
+// The code exchange targets the issuer that produced the code; caller persists.
+async function exchangeCode(issuerOrigin, code, verifier, redirectUri) {
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code,
@@ -206,22 +240,90 @@ async function exchangeCode(origin, code, verifier, redirectUri) {
     client_id: OAUTH_CLIENT_ID,
     code_verifier: verifier,
   });
-  const tokens = await postToken(origin, body);
-  saveTokens(origin, tokens);
-  return tokens;
+  return postToken(`${issuerOrigin}/oidc/v1/token`, body);
 }
 
-async function refreshTokens(origin, refreshToken) {
+/**
+ * Token endpoint for a refresh. A workspace-scoped token refreshes at the
+ * workspace's own endpoint; an account-scoped (SPOG) token must refresh at the
+ * account endpoint WITH the account id in the path — the accounts host serves
+ * every account, and a refresh carries no code for the server to resolve it
+ * from (mirrors genie-one-desktop's account OIDC discovery).
+ */
+function refreshEndpoint(workspaceOrigin, account) {
+  return account
+    ? `${account.origin}/oidc/accounts/${account.id}/v1/token`
+    : `${workspaceOrigin}/oidc/v1/token`;
+}
+
+// One in-flight refresh per store key. Single-use (rotating) refresh tokens
+// can't be spent twice: without this, concurrent windows on one origin would
+// each POST the same token, and all but one would get invalid_grant — revoking
+// the whole grant. Sharing one promise also makes the persist single-writer.
+const inflightRefresh = new Map();
+
+async function doRefresh(workspaceOrigin, entry) {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
-    refresh_token: refreshToken,
+    refresh_token: entry.refresh_token,
     client_id: OAUTH_CLIENT_ID,
   });
-  const tokens = await postToken(origin, body);
-  // A refresh response may omit a fresh refresh_token; keep the working one.
-  if (!tokens.refresh_token) tokens.refresh_token = refreshToken;
-  saveTokens(origin, tokens);
-  return tokens;
+  let minted;
+  try {
+    minted = await postToken(refreshEndpoint(workspaceOrigin, entry.account), body);
+  } catch (e) {
+    // A dead/consumed grant (reuse detection, or past max lifetime) — clear it so
+    // we fall to a fresh login instead of looping on a token the server rejects.
+    if (e.status === 400 || e.status === 401) {
+      deleteStoredToken(workspaceOrigin);
+    }
+    throw e;
+  }
+  const next = {
+    access_token: minted.access_token,
+    // Rotating servers return a fresh refresh_token (the old one is now spent);
+    // non-rotating servers omit it, so keep the working one.
+    refresh_token: minted.refresh_token ?? entry.refresh_token,
+    expires_at: minted.expires_at,
+    account: entry.account,
+  };
+  saveTokens(workspaceOrigin, next);
+  return next;
+}
+
+function refreshStoredToken(workspaceOrigin, entry) {
+  const key = storeKey(workspaceOrigin);
+  const existing = inflightRefresh.get(key);
+  if (existing) return existing;
+  const p = doRefresh(workspaceOrigin, entry).finally(() => inflightRefresh.delete(key));
+  inflightRefresh.set(key, p);
+  return p;
+}
+
+/**
+ * A valid access token for a workspace origin from the store alone — no browser.
+ * Returns the stored token if still valid, else refreshes (rotating the refresh
+ * token when the server does). Throws if there is nothing stored, or the refresh
+ * fails — the caller decides whether to fall back to an interactive login.
+ *
+ * @param {string} workspaceOrigin
+ * @returns {Promise<string>} A bearer access token.
+ */
+async function getValidStoredToken(workspaceOrigin) {
+  const entry = loadTokens(workspaceOrigin);
+  if (!entry || typeof entry.access_token !== "string") {
+    throw new Error(`no stored Databricks token for ${workspaceOrigin}`);
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof entry.expires_at === "number" && entry.expires_at > now) {
+    return entry.access_token;
+  }
+  if (typeof entry.refresh_token === "string" && entry.refresh_token) {
+    return (await refreshStoredToken(workspaceOrigin, entry)).access_token;
+  }
+  throw new Error(
+    `stored Databricks token for ${workspaceOrigin} is expired with no refresh token`,
+  );
 }
 
 // ── Interactive browser login (loopback redirect) ───────────────────────────
@@ -340,52 +442,14 @@ async function runInteractiveLogin(origin) {
     issuerOrigin = new URL(callback.iss).origin;
   }
   const tokens = await exchangeCode(issuerOrigin, callback.code, verifier, redirectUri);
-  return { tokens, workspaceOrigin: issuerOrigin };
-}
-
-/**
- * Return a valid access token plus the origin it was issued by, minting or
- * refreshing as needed. The issuer can differ from the entered origin (an
- * account host issues an account-scoped token), so callers read the returned
- * ``workspaceOrigin``. With ``interactive: false`` (the session-expiry path) it
- * never opens a browser — it uses a stored/refreshable token or throws.
- *
- * @param {string} origin The entered origin (account host or workspace host).
- * @param {{ interactive?: boolean }} [opts]
- * @returns {Promise<{ accessToken: string, workspaceOrigin: string }>}
- */
-async function getValidAccessToken(origin, { interactive = true } = {}) {
-  const stored = loadTokens(origin);
-  const now = Math.floor(Date.now() / 1000);
-  if (
-    stored &&
-    typeof stored.access_token === "string" &&
-    typeof stored.expires_at === "number" &&
-    stored.expires_at > now
-  ) {
-    return { accessToken: stored.access_token, workspaceOrigin: origin };
-  }
-  if (stored && typeof stored.refresh_token === "string" && stored.refresh_token) {
-    try {
-      const t = await refreshTokens(origin, stored.refresh_token);
-      return { accessToken: t.access_token, workspaceOrigin: origin };
-    } catch (e) {
-      console.warn("[omnigent] databricks token refresh failed:", e.message);
-      if (!interactive) throw e;
-    }
-  }
-  if (!interactive) {
-    throw new Error("no valid Databricks token and interactive login is disabled");
-  }
-  const { tokens, workspaceOrigin } = await runInteractiveLogin(origin);
-  return { accessToken: tokens.access_token, workspaceOrigin };
+  return { tokens, issuerOrigin };
 }
 
 module.exports = {
   databricksOAuthConfigured,
-  getValidAccessToken,
   runInteractiveLogin,
-  refreshTokens,
+  getValidStoredToken,
+  saveWorkspaceToken,
   loadTokens,
   isTrustedDatabricksOrigin,
 };
