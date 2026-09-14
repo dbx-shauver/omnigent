@@ -1159,13 +1159,18 @@ export interface SessionItemsPage {
  */
 export async function fetchSessionItemsPage(
   sessionId: string,
-  { olderThan, limit = SESSION_HISTORY_PAGE_SIZE }: { olderThan?: string; limit?: number } = {},
+  {
+    olderThan,
+    limit = SESSION_HISTORY_PAGE_SIZE,
+    signal,
+  }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
 ): Promise<SessionItemsPage> {
   const params = new URLSearchParams({ limit: String(limit), order: "desc" });
   // "Older than the cursor" within a descending scan = items after it.
   if (olderThan) params.set("after", olderThan);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    { signal },
   );
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
@@ -1298,6 +1303,37 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
 /** Reconnect or relaunch the existing runner without replaying user input. */
 export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });
+}
+
+// Multiple error cards can describe the same failed turn.
+const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+
+/** Continue a rate-limited turn without replaying the original prompt or tools. */
+export function retryRateLimitedTurn(sessionId: string): Promise<void> {
+  const pending = rateLimitedTurnRetries.get(sessionId);
+  if (pending) return pending;
+
+  const retry = postEvent(sessionId, {
+    type: "message",
+    data: {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: "Please continue from where you left off before the rate limit error.",
+        },
+      ],
+    },
+  })
+    .then((result) => {
+      if (result.denied) throw new Error("The retry was blocked by a policy");
+      if (!result.queued) throw new Error("The retry was not accepted");
+    })
+    .finally(() => {
+      rateLimitedTurnRetries.delete(sessionId);
+    });
+  rateLimitedTurnRetries.set(sessionId, retry);
+  return retry;
 }
 
 /**

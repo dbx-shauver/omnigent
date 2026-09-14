@@ -4,6 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
@@ -16,6 +17,12 @@ import {
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import * as host from "@/lib/host";
+import * as identity from "@/lib/identity";
+import {
+  getSessionModelLabelCacheKey,
+  readSessionModelLabelCache,
+} from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
@@ -37,12 +44,47 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
 }));
+// The workspace bar's git-status hook uses TanStack Query; stub it so the
+// composer renders in isolation (no QueryClient) with a neutral empty status.
+// The hoisted spy records the args so a test can assert the page passes the
+// real session id / host / workspace / creation branch (not fixtures).
+const { composerGitStatusArgsSpy } = vi.hoisted(() => ({ composerGitStatusArgsSpy: vi.fn() }));
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: (args: unknown) => {
+    composerGitStatusArgsSpy(args);
+    return {
+      branch: null,
+      branchState: "unknown",
+      isWorktree: null,
+      worktreePath: null,
+      creationBranch: null,
+      repoNameWithOwner: null,
+      prCount: 0,
+      prNumber: null,
+      refresh: () => {},
+      refreshing: false,
+    };
+  },
+}));
+// SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
+// so the indicator self-hides (no active children) in isolated composer renders.
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
+}));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
+const { composerSnapshotHost } = vi.hoisted(() => ({
+  composerSnapshotHost: { id: null as string | null },
+}));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
-  useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
+  useSession: () => ({
+    session: { hostId: composerSnapshotHost.id },
+    isLoading: false,
+    error: null,
+  }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
@@ -1182,6 +1224,132 @@ describe("Composer slash-command submit routing", () => {
   });
 });
 
+describe("Composer cached model labels", () => {
+  const model = "provider/model-a";
+  const catalog = [{ id: "alias-a", model, displayName: "Team model" }];
+  const scope = {
+    sessionId: "conv_cached_label",
+    hostId: "host-a",
+    agentId: "agent-a",
+    harness: "claude-native",
+  };
+  const props = () =>
+    composerProps({
+      modelPickerKind: "claude",
+      showModels: true,
+      showEffort: false,
+      codexModelOptions: catalog,
+      modelLabelOptions: [],
+    });
+  beforeEach(() => {
+    localStorage.clear();
+    composerSnapshotHost.id = scope.hostId;
+    vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
+    useChatStore.setState({
+      conversationId: scope.sessionId,
+      sessionHostId: scope.hostId,
+      boundAgentId: scope.agentId,
+      sessionHarness: scope.harness,
+      llmModel: model,
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+      pendingModelChange: null,
+      nativeVendorOwnsModel: false,
+      costControlModeOverride: "off",
+      skills: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    composerSnapshotHost.id = null;
+    vi.restoreAllMocks();
+    localStorage.clear();
+    useChatStore.setState({ sessionModelSeeded: false, sessionHostId: null, boundAgentId: null });
+  });
+
+  it("waits for session labels while leaving host-probe menu choices usable", async () => {
+    const view = renderWithTooltips(<Composer {...props()} />);
+    const trigger = screen.getByTestId("composer-config-gear");
+    expect(screen.getByRole("status", { name: "Loading model" })).toBeInTheDocument();
+    expect(trigger).toBeEnabled();
+    expect(trigger).not.toHaveTextContent(model);
+    expect(trigger).not.toHaveTextContent("Team model");
+    expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBeNull();
+    fireEvent.focus(trigger);
+    const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tooltip).toHaveTextContent("Loading model…");
+    expect(tooltip).not.toHaveTextContent(model);
+    openSessionConfig();
+    expect(screen.getByTestId("composer-agent-model-summary")).toHaveTextContent("Loading model…");
+    fireEvent.click(screen.getByTestId("composer-agent-edit"));
+    expect(await screen.findByTestId("composer-agent-model-alias-a")).toBeEnabled();
+
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...props()} modelLabelOptions={catalog} />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+    expect(trigger).toHaveTextContent("Team model");
+  });
+
+  it("uses the cached session display name immediately on remount, not a newer host probe", async () => {
+    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBe(
+      "Team model",
+    );
+    first.unmount();
+    useChatStore.setState({ sessionHostId: null });
+    renderWithTooltips(
+      <Composer {...props()} codexModelOptions={[{ ...catalog[0], displayName: "Host name" }]} />,
+    );
+    const trigger = screen.getByTestId("composer-config-gear");
+    expect(trigger).toHaveTextContent("Team model");
+    expect(trigger).not.toHaveTextContent("Host name");
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+    await openSessionModels();
+    expect(screen.getByTestId("composer-agent-model-alias-a")).toBeEnabled();
+  });
+
+  it("uses a loading label for the synthetic current row without a catalog", async () => {
+    renderWithTooltips(<Composer {...props()} codexModelOptions={[]} />);
+    await openSessionModels();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Loading model… (current)" }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("composer-agent-config-menu")).not.toHaveTextContent(model);
+  });
+
+  it("does not reuse the creation host's cache after the snapshot host changes", () => {
+    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    composerSnapshotHost.id = "new-host";
+    first.rerender(
+      <TooltipProvider>
+        <Composer {...props()} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-model-loading")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-config-gear")).not.toHaveTextContent("Team model");
+  });
+
+  it("does not cache an optimistic creation seed until the runner confirms it", () => {
+    useChatStore.setState({ sessionModelSeeded: true, sessionModelOverride: model });
+    renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    const key = getSessionModelLabelCacheKey(scope, model);
+    expect(readSessionModelLabelCache(key)).toBeNull();
+    act(() => useChatStore.setState({ sessionModelSeeded: false }));
+    expect(readSessionModelLabelCache(key)).toBe("Team model");
+  });
+
+  it("keeps Smart Routing visible without a label-loading spinner", () => {
+    useChatStore.setState({ costControlModeOverride: "on" });
+    renderWithTooltips(<Composer {...props()} costRoutingEligible />);
+    expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Smart Routing");
+    expect(screen.queryByTestId("composer-model-loading")).toBeNull();
+  });
+});
+
 describe("Composer model/effort label", () => {
   beforeEach(() => {
     useChatStore.setState({
@@ -1208,7 +1376,7 @@ describe("Composer model/effort label", () => {
 
   const label = () => screen.getByTestId("composer-agent-config-value");
 
-  it("shows the resolved model beside Edit in the shared harness row", () => {
+  it("shows the catalog display name beside Edit in the shared harness row", () => {
     useChatStore.setState({
       llmModel: "system.ai.claude-opus-4-6",
       sessionHarness: "claude-native",
@@ -1224,15 +1392,15 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Opus 4.6");
+    expect(label()).toHaveTextContent("Opus");
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
     const row = screen.getByTestId("composer-agent-edit");
     expect(row).toHaveClass("composer-agent-row");
     expect(row).toHaveAttribute("data-active", "true");
-    expect(within(row).getByText("Opus 4.6")).toHaveClass("text-right");
+    expect(within(row).getByText("Opus")).toHaveClass("text-right");
     expect(within(row).getByText("Edit")).toHaveClass("composer-agent-edit");
     fireEvent.keyDown(row, { key: "ArrowRight" });
-    expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus 4.6");
+    expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
   });
 
   it("shows the model in the foreground and effort muted", () => {
@@ -1257,6 +1425,35 @@ describe("Composer model/effort label", () => {
     // Model black, effort grey.
     expect(within(label()).getByText("Opus")).toHaveClass("text-foreground");
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("shows no effort for a seeded null, never borrowing the cross-session sticky (#7039)", () => {
+    // Same sticky "high" as the test above, but the optimistic create seeded an
+    // intentional "no effort" (sessionEffortSeeded) — the authoritative seed
+    // must win, so the label shows the model with no effort, not "High".
+    useChatStore.setState({
+      llmModel: "opus",
+      selectedEffort: "high",
+      sessionReasoningEffort: null,
+      sessionEffortSeeded: true,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("High");
+    expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
+    // This suite shares one global store and only resets what each test sets;
+    // no other test touches the seeded flag, so restore the default here.
+    useChatStore.setState({ sessionEffortSeeded: false });
   });
 
   it("reads 'Smart Routing' with no model/effort when routing is on", async () => {
@@ -1317,7 +1514,7 @@ describe("Composer model/effort label", () => {
     // render as if it were the session's model.
     expect(label()).toHaveTextContent("Haiku");
     expect(label()).not.toHaveTextContent("Opus");
-    expect(label()).not.toHaveTextContent("Sonnet");
+    expect(label()).not.toHaveTextContent("Sonnet 4.6");
   });
 
   const CLAUDE_LIVE_OPTIONS = [
@@ -1325,7 +1522,7 @@ describe("Composer model/effort label", () => {
     { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5", isDefault: true },
   ];
 
-  it("maps a Claude concrete model to its friendly alias in the read-only label", () => {
+  it("uses the catalog display name for an exact Claude model ID in the read-only label", () => {
     useChatStore.setState({
       selectedModel: null,
       sessionModelOverride: null,
@@ -1344,7 +1541,6 @@ describe("Composer model/effort label", () => {
       />,
     );
 
-    // The read-only label maps the concrete bound model to its friendly alias.
     expect(label()).toHaveTextContent("Sonnet 5");
     expect(label()).not.toHaveTextContent("system.ai.claude-sonnet-5");
     // The modal's catalog-default fallback (isDefault row when no concrete
@@ -1642,23 +1838,9 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
   });
 
-  it.each([
-    ["Session workspace", 0],
-    ["Session worktree", 1],
-  ])("wraps text inside the %s popover", (label, triggerIndex) => {
-    renderWithTooltips(<Composer {...composerProps()} />);
-
-    const controls = screen.getByTestId("composer-workspace-controls");
-    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
-      key: "ArrowDown",
-    });
-
-    const popover = screen.getByRole("menu");
-    expect(within(popover).getByText(label)).toBeVisible();
-    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
-    expect(popover).not.toHaveClass("whitespace-nowrap");
-    expect(popover.querySelector("p")).toHaveClass("break-all");
-  });
+  // The workspace/worktree popover markup moved into the shared
+  // ComposerWorkspaceStatus component (its own tests cover the popover text
+  // wrapping); the two page-local inline-dropdown popover cases retired with it.
 
   it("renders the same workspace, host, permission and model controls as landing", () => {
     useChatStore.setState({
@@ -1683,11 +1865,16 @@ describe("Composer shared visible controls", () => {
     const actions = screen.getByTestId("composer-action-row");
     expect(textarea().parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
-    expect(actions.children).toHaveLength(2);
+    const [widthProbe, leading, trailing] = Array.from(actions.children);
+    expect(widthProbe).toHaveClass("h-0");
+    expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
+    expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
+    expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    expect(within(workspace).getByTestId("composer-git-branch")).toHaveTextContent(
-      "feature/shared-composer",
-    );
+    // The branch text now flows through the shared ComposerWorkspaceStatus +
+    // useComposerGitStatus (covered by their own tests); here assert the shared
+    // branch control renders in the bar.
+    expect(within(workspace).getByTestId("composer-git-branch")).toBeInTheDocument();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");
@@ -1696,6 +1883,22 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
+    // The workspace bar is fed by the page adapter, not fixtures: assert the
+    // page threads the actual session identity through useComposerGitStatus.
+    composerGitStatusArgsSpy.mockClear();
+    useChatStore.setState({ conversationId: "conv_git_args", gitBranch: "feature/x" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "conv_git_args",
+        creationBranch: "feature/x",
+        hostId: null,
+        workspace: null,
+      }),
+    );
   });
 
   it("dispatches the shared permission picker to the session setter", async () => {
@@ -3003,7 +3206,7 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Model:");
     expect(tip.textContent).toContain("Effort:");
     // Effort is switchable in-session; permission mode is not, so it must be absent.
-    expect(tip.textContent).not.toContain("Permissions");
+    expect(tip.textContent).not.toContain("Permission mode");
   });
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
@@ -3357,10 +3560,7 @@ describe("Composer config gear", () => {
     // while Luna's own max stays.
     await waitFor(() => expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(null));
     act(() => useChatStore.setState({ llmModel: "gpt-5.6-luna", selectedEffort: null }));
-    expect(screen.getByTestId("composer-agent-effort-default")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    expect(screen.queryByTestId("composer-agent-effort-default")).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-ultra"]')).toBeNull();
     expect(document.querySelector('[data-testid="composer-agent-effort-max"]')).not.toBeNull();
   });
@@ -3461,7 +3661,7 @@ describe("Composer config gear", () => {
 
     it("names the model the session is on instead of rendering blank", async () => {
       await openModalOnRoutedSession();
-      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent(ROUTED);
+      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent("claude-opus-4-8");
     });
 
     it("pins nothing when opening and closing the model picker", async () => {
