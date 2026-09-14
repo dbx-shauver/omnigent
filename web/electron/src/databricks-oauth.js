@@ -13,6 +13,8 @@
 //                                        loopback redirect. Databricks ignores the port per RFC 8252,
 //                                        so an ephemeral free port is bound unless one is pinned.)
 //   OMNIGENT_DATABRICKS_OAUTH_SCOPES    (default "all-apis offline_access")
+//   OMNIGENT_DATABRICKS_OAUTH_FORCE_REFRESH=1  (testing: treat the stored access token as always
+//                                        expired, so the refresh path runs on every connect/reload)
 //
 // The authorize request goes directly to the entered origin's /oidc/v1/authorize.
 // A workspace host yields a workspace-scoped token; an account/SPOG host yields an
@@ -263,22 +265,31 @@ function refreshEndpoint(workspaceOrigin, account) {
 const inflightRefresh = new Map();
 
 async function doRefresh(workspaceOrigin, entry) {
+  const endpoint = refreshEndpoint(workspaceOrigin, entry.account);
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: entry.refresh_token,
     client_id: OAUTH_CLIENT_ID,
   });
+  console.log(
+    `[omnigent] databricks oauth: refreshing token for ${workspaceOrigin} at ${endpoint}`,
+  );
   let minted;
   try {
-    minted = await postToken(refreshEndpoint(workspaceOrigin, entry.account), body);
+    minted = await postToken(endpoint, body);
   } catch (e) {
     // A dead/consumed grant (reuse detection, or past max lifetime) — clear it so
     // we fall to a fresh login instead of looping on a token the server rejects.
     if (e.status === 400 || e.status === 401) {
       deleteStoredToken(workspaceOrigin);
+      console.warn(
+        `[omnigent] databricks oauth: grant dead (HTTP ${e.status}) for ${workspaceOrigin}; ` +
+          "cleared stored token, will require a fresh login",
+      );
     }
     throw e;
   }
+  const rotated = typeof minted.refresh_token === "string" && minted.refresh_token !== "";
   const next = {
     access_token: minted.access_token,
     // Rotating servers return a fresh refresh_token (the old one is now spent);
@@ -288,6 +299,10 @@ async function doRefresh(workspaceOrigin, entry) {
     account: entry.account,
   };
   saveTokens(workspaceOrigin, next);
+  console.log(
+    `[omnigent] databricks oauth: refreshed ${workspaceOrigin} ` +
+      `(refresh_token rotated=${rotated}, valid ~${Math.max(0, next.expires_at - Math.floor(Date.now() / 1000))}s)`,
+  );
   return next;
 }
 
@@ -315,10 +330,22 @@ async function getValidStoredToken(workspaceOrigin) {
     throw new Error(`no stored Databricks token for ${workspaceOrigin}`);
   }
   const now = Math.floor(Date.now() / 1000);
-  if (typeof entry.expires_at === "number" && entry.expires_at > now) {
+  // Testing lever: OMNIGENT_DATABRICKS_OAUTH_FORCE_REFRESH=1 treats the stored
+  // access token as always expired, so the refresh path runs on every connect
+  // and every session-expiry reload — no waiting for real expiry to exercise it.
+  const forceRefresh = process.env.OMNIGENT_DATABRICKS_OAUTH_FORCE_REFRESH === "1";
+  if (!forceRefresh && typeof entry.expires_at === "number" && entry.expires_at > now) {
+    console.log(
+      `[omnigent] databricks oauth: using cached token for ${workspaceOrigin} ` +
+        `(valid ~${entry.expires_at - now}s)`,
+    );
     return entry.access_token;
   }
   if (typeof entry.refresh_token === "string" && entry.refresh_token) {
+    console.log(
+      `[omnigent] databricks oauth: ${forceRefresh ? "FORCE_REFRESH" : "token expired"} for ` +
+        `${workspaceOrigin} → refreshing`,
+    );
     return (await refreshStoredToken(workspaceOrigin, entry)).access_token;
   }
   throw new Error(
