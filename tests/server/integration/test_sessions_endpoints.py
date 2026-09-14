@@ -8107,10 +8107,11 @@ async def test_permission_mode_restart_keeps_settings_defaults_unpinned(
     session = await _create_session(client, agent["id"], terminal_launch_args=initial_args)
     endpoint = f"/v1/sessions/{session['id']}"
     monkeypatch.setattr(fwd, "_PANE_POLL_INTERVAL_S", 0.0)
-    pane_mode = "default"
-    monkeypatch.setattr(fwd, "read_pane_signals", lambda _: PaneSignals(permission_mode=pane_mode))
 
-    async def poll(dedupe: fwd._ForwardDedupeState) -> dict[str, Any]:
+    async def poll(pane_mode: str, dedupe: fwd._ForwardDedupeState) -> dict[str, Any]:
+        monkeypatch.setattr(
+            fwd, "read_pane_signals", lambda _: PaneSignals(permission_mode=pane_mode)
+        )
         await fwd._forward_pane_signals(
             client=client,
             session_id=session["id"],
@@ -8123,15 +8124,17 @@ async def test_permission_mode_restart_keeps_settings_defaults_unpinned(
 
     # Each launch reads a different settings default against the same saved row.
     for pane_mode in ("default", "auto", "default"):
-        dedupe = fwd._ForwardDedupeState()
-        assert (await poll(dedupe))["terminal_launch_args"] == initial_args
+        snapshot = await poll(pane_mode, fwd._ForwardDedupeState())
+        assert snapshot["terminal_launch_args"] == initial_args
 
     # Explicit in-pane selections, including Manual, survive subsequent launches.
+    dedupe = fwd._ForwardDedupeState()
+    assert (await poll("default", dedupe))["terminal_launch_args"] == initial_args
     for pane_mode in ("auto", "default"):
         expected_args = [*(initial_args or []), "--permission-mode", pane_mode]
-        assert (await poll(dedupe))["terminal_launch_args"] == expected_args
+        assert (await poll(pane_mode, dedupe))["terminal_launch_args"] == expected_args
         dedupe = fwd._ForwardDedupeState()
-        assert (await poll(dedupe))["terminal_launch_args"] == expected_args
+        assert (await poll(pane_mode, dedupe))["terminal_launch_args"] == expected_args
 
 
 async def test_post_external_codex_approval_mode_change_persists_terminal_args(
