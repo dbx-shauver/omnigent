@@ -74,11 +74,9 @@ _ADAPTIVE_REJECT_MSG = (
 # the loopback workspace + one turn. Generous for a loaded CI box.
 _RUN_TIMEOUT_S = 240
 
-# Env vars that, leaked from this (possibly omnigent-hosted) process into the
-# CLI subprocess, would shadow the fake workspace's credentials or misroute
-# the run. Every OMNIGENT* var is stripped by prefix below: a leaked
-# OMNIGENT_DATA_DIR (or runner var) routes the run through the hosting
-# session's live host daemon instead of a standalone one-shot run.
+# Ambient credentials/proxies that would shadow the fake workspace or misroute
+# the run; every OMNIGENT* var is also stripped below so a leaked data dir or
+# runner var cannot route the run through a hosting session's daemon.
 _STALE_ENV_VARS = (
     "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
@@ -120,8 +118,12 @@ class _FakeWorkspaceHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(length) if length else b""
 
-    def _record(self, method: str, body: bytes) -> None:
-        entry: dict[str, Any] = {"method": method, "path": self.path}
+    def _path(self) -> str:
+        """Request path without the query string Pi appends (``?beta=true``)."""
+        return self.path.split("?", 1)[0]
+
+    def _record(self, method: str, path: str, body: bytes) -> None:
+        entry: dict[str, Any] = {"method": method, "path": path}
         if body:
             try:
                 entry["json"] = json.loads(body)
@@ -139,8 +141,9 @@ class _FakeWorkspaceHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        self._record("GET", b"")
-        if self.path.startswith("/api/2.1/unity-catalog/model-services"):
+        path = self._path()
+        self._record("GET", path, b"")
+        if path.startswith("/api/2.1/unity-catalog/model-services"):
             self._send_json(
                 200,
                 {
@@ -152,15 +155,16 @@ class _FakeWorkspaceHandler(BaseHTTPRequestHandler):
                     ]
                 },
             )
-        elif self.path.startswith("/ai-gateway/anthropic/v1/models"):
+        elif path.startswith("/ai-gateway/anthropic/v1/models"):
             self._send_json(200, {"data": [{"id": _CLAUDE_MODEL}]})
         else:
             self._send_json(200, {})
 
     def do_POST(self) -> None:
         body = self._read_body()
-        self._record("POST", body)
-        if "/serving-endpoints/anthropic" in self.path and self.path.endswith("/messages"):
+        path = self._path()
+        self._record("POST", path, body)
+        if "/serving-endpoints/anthropic" in path and path.endswith("/messages"):
             try:
                 payload = json.loads(body)
             except ValueError:
@@ -171,7 +175,7 @@ class _FakeWorkspaceHandler(BaseHTTPRequestHandler):
                 return
             self._send_sse_completion(payload)
         else:
-            self._send_json(404, {"message": f"no handler for {self.path}"})
+            self._send_json(404, {"message": f"no handler for {path}"})
 
     def _send_sse_completion(self, payload: dict[str, Any]) -> None:
         """Stream a minimal valid Anthropic Messages completion ("PONG")."""
@@ -338,7 +342,7 @@ def test_unpinned_pi_agent_first_turn_survives_claude_thinking_contract(
         encoding="utf-8",
     )
 
-    env = dict(os.environ)
+    env = os.environ.copy()
     for stale in _STALE_ENV_VARS:
         env.pop(stale, None)
     for leaked in [name for name in env if name.startswith(("HARNESS_PI_", "OMNIGENT"))]:

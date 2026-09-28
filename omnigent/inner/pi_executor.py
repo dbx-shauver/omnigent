@@ -818,13 +818,9 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
-                # Claude 4+/5 reject the legacy ``thinking.type.enabled`` payload
-                # and require ``thinking.type.adaptive`` + ``output_config.effort``.
-                # Pi 0.84.2+ sends adaptive when ``forceAdaptiveThinking`` is set in
-                # the provider compat block; without it an unpinned pi agent (whose
-                # default model resolves to a Databricks Claude model) 400s on its
-                # first turn. Mirrors the pi-native path in
-                # ``harnesses/pi_native/credentials.py``.
+                # Claude 4+/5 reject ``thinking.type.enabled``; Pi 0.84.2+ sends
+                # ``thinking.type.adaptive`` only with this compat flag (same as
+                # the pi-native provider in ``harnesses/pi_native/credentials.py``).
                 "compat": {"forceAdaptiveThinking": True},
                 "models": provider_models["databricks-anthropic"],
             },

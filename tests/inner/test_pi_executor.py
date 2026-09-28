@@ -474,12 +474,8 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks-completions", providers)
 
     def test_anthropic_provider_forces_adaptive_thinking(self):
-        # Claude 4+/5 reject the legacy ``thinking.type.enabled`` payload and
-        # require ``thinking.type.adaptive`` + ``output_config.effort``. Pi sends
-        # adaptive only when ``forceAdaptiveThinking`` is set in the provider
-        # compat block; without it an unpinned pi agent (default model resolves
-        # to a Databricks Claude model) 400s on its first turn. The pi-native
-        # path already sets this in ``harnesses/pi_native/credentials.py``.
+        # Without this compat flag Pi sends ``thinking.type.enabled``, which
+        # Claude 4+/5 gateway models reject with 400 on the first turn.
         result = _build_models_json("https://host.example.com", "tok123")
         compat = result["providers"]["databricks-anthropic"].get("compat", {})
         self.assertIs(compat.get("forceAdaptiveThinking"), True)
